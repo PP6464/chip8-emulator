@@ -36,7 +36,7 @@ int main(const int argc, char **argv) {
     CHIP8_DISPLAY * display = &(CHIP8_DISPLAY) {nullptr, nullptr, nullptr};
 
     char title[32 + sizeof(argv[1])];
-    snprintf(title, sizeof(title), "Chip 8 Emulator - %s", argv[1]);
+    snprintf(title, sizeof(title), "Chip 8 Emulator - %s", filename);
 
     init_display(display, title);
 
