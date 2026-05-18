@@ -21,7 +21,7 @@ typedef struct {
     uint8_t sound_timer;
     uint8_t display[DISPLAY_H * DISPLAY_W];
     uint8_t keypad[16];
-    int sample_index;                       // This is for the audio player
+    uint32_t sample_index;                   // This is for the audio player
 } CHIP8_CPU;
 
 void init_cpu(CHIP8_CPU *cpu);

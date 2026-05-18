@@ -10,11 +10,11 @@ void audio_callback(void *userdata, Uint8 *stream, const int len) {
         if (cpu->sound_timer > 0) {
             const double t = (double) cpu->sample_index / SAMPLE_RATE;
             buf[i] = (Sint16) (AMPLITUDE * sin(2.0 * M_PI * FREQUENCY * t));
-            cpu->sample_index++;
         } else {
             buf[i] = 0;
-            cpu->sample_index = 0;
         }
+
+        cpu->sample_index++;
 
         // Decrement the sound timer and delay timer at 60Hz
         if (cpu->sample_index % (SAMPLE_RATE / SOUND_TIME_DEC_RATE) == 0) {
@@ -22,6 +22,8 @@ void audio_callback(void *userdata, Uint8 *stream, const int len) {
             if (cpu->delay_timer) cpu->delay_timer--;
         }
     }
+
+    cpu->sample_index %= SAMPLE_RATE;
 }
 
 void init_audio(CHIP8_CPU *cpu) {
