@@ -6,15 +6,31 @@
 #include <audio.h>
 
 int main(const int argc, char **argv) {
+    char filename[100];
+
     if (argc < 2) {
-        fprintf(stderr, "Usage: chip8 <file_name>\n");
-        return 1;
+        printf("Enter the name of the file to run: \n");
+        const char *str = fgets(filename, sizeof(filename), stdin);
+        if (str == nullptr) {
+            fprintf(stderr, "Could not read your input.");
+            return 1;
+        }
+
+        // Remove '\n' at the end
+        int i = 0;
+        while (str[i] != '\n' && str[i] != '\0') {
+            i++;
+        }
+
+        filename[i] = '\0';
+    } else {
+        memcpy(filename, argv[1], sizeof(filename));
     }
 
     // Initialise the CPU
     CHIP8_CPU *cpu = malloc(sizeof(CHIP8_CPU));
     init_cpu(cpu);
-    load_rom(cpu, argv[1]);
+    load_rom(cpu, filename);
 
     // Initialise the display
     CHIP8_DISPLAY * display = &(CHIP8_DISPLAY) {nullptr, nullptr, nullptr};
