@@ -14,6 +14,13 @@ int main(const int argc, char **argv) {
         return 1;
     }
 
+    const char *mode = argv[1];
+
+    if (strcmp(mode, "run") != 0 && strcmp(mode, "asm") != 0) {
+        fprintf(stderr, "Incorrect mode: %s. Can only have modes asm and run\n", mode);
+        return 1;
+    }
+
     if (argc < 3) {
         printf("Enter the name of the file: \n");
         const char *str = fgets(filename, sizeof(filename), stdin);
@@ -32,8 +39,6 @@ int main(const int argc, char **argv) {
     } else {
         memcpy(filename, argv[2], sizeof(filename));
     }
-
-    char *mode = argv[1];
 
     if (strcmp(mode, "run") == 0) {
         // Initialise the CPU
@@ -103,11 +108,6 @@ int main(const int argc, char **argv) {
         return 0;
     }
 
-    if (strcmp(mode, "asm") == 0) {
-        assemble(filename, filename);
-        return 0;
-    }
-
-    fprintf(stderr, "Incorrect mode: %s. Can only have modes asm and run", mode);
-    return 1;
+    assemble(filename, filename);
+    return 0;
 }
