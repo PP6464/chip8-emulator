@@ -22,7 +22,7 @@ int main(const int argc, char **argv) {
     }
 
     if (argc < 3) {
-        printf("Enter the name of the file: \n");
+        printf("Enter the name of the file (without file extension): \n");
         const char *str = fgets(filename, sizeof(filename), stdin);
         if (str == nullptr) {
             fprintf(stderr, "Could not read your input.");

@@ -32,7 +32,7 @@ void init_cpu(CHIP8_CPU *cpu) {
 
 void load_rom(CHIP8_CPU *cpu, const char *rom_file) {
     char path[16 + strlen(rom_file)];
-    snprintf(path, 16 + strlen(rom_file), "rom/%s", rom_file);
+    snprintf(path, 16 + strlen(rom_file), "rom/%s.ch8", rom_file);
 
     FILE *rom = fopen(path, "rb");
     if (!rom) {
