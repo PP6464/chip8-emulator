@@ -40,6 +40,12 @@ void load_rom(CHIP8_CPU *cpu, const char *rom_file) {
         exit(1);  // Erroneous exit
     }
     fread(cpu->memory + ROM_START, 1, MEMORY_SIZE - ROM_START, rom);
+    const int result = fclose(rom);
+
+    if (result != 0) {
+        fprintf(stderr, "Error closing file %s", path);
+        exit(1);
+    }
 }
 
 void cpu_cycle(CHIP8_CPU *cpu) {
