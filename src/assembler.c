@@ -942,7 +942,7 @@ void assemble(const char *input_file_name, const char *output_file_name) {
     char output_file_path[32 + strlen(output_file_name)];
 
     snprintf(input_file_path, 32 + strlen(input_file_name), "chip8-source/%s.c8c", input_file_name);
-    snprintf(output_file_path, 32 + strlen(output_file_name), "assembled/%s.ch8", output_file_name);
+    snprintf(output_file_path, 32 + strlen(output_file_name), "rom/%s.ch8", output_file_name);
 
     FILE *input = fopen(input_file_path, "r");
     FILE *output = fopen(output_file_path, "wb");
