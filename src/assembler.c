@@ -794,6 +794,8 @@ static void emit_bytes(FILE *input, FILE *output, const SymbolTable *table) {
                         uint16_t reg;
                         parse_hex(line_start + 7, &reg);
                         opcode = 0xF01E | reg << 8;
+
+                        break;
                     }
 
                     // Otherwise the first argument is a register
@@ -805,6 +807,8 @@ static void emit_bytes(FILE *input, FILE *output, const SymbolTable *table) {
                         uint16_t reg_y;
                         parse_hex(line_start + 8, &reg_y);
                         opcode = 0x8004 | reg_x << 8 | reg_y << 4;
+
+                        break;
                     }
 
                     uint16_t byte;
