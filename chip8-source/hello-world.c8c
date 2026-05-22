@@ -1,0 +1,35 @@
+
+
+CODE:
+
+; John Haskell
+
+
+FUNCTION draw_h
+    LOAD V0 10
+    LOAD I <H>
+    DRAW V0 V0 5
+    RET
+
+FUNCTION draw_i
+    LOAD V0 20
+    LOAD V1 10
+    LOAD I <I>
+    DRAW V0 V1 5
+    RET
+
+FUNCTION play_sound
+    LOAD V0 80
+    LOAD ST V0
+    RET
+
+FUNCTION main
+    CALL <draw_h>
+    CALL <draw_i>
+    CALL <play_sound>
+    LABEL jmp
+    JUMP <jmp>
+
+DATA:
+H: 81 81 FF 81 81
+I: FF 18 18 18 FF

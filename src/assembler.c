@@ -1,410 +1,983 @@
+// ReSharper disable CppDFANullDereference
 #include <assembler.h>
+#include <cpu.h>
 #include <stdio.h>
-#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#include <sys/stat.h>
-
-static void strip_newline(char *s) {
-    size_t len = strlen(s);
-    while (len > 0 && (s[len - 1] == '\n' || s[len - 1] == '\r'))
-        s[--len] = '\0';
-}
+#include <regex.h>
 
 static int parse_hex(const char *s, uint16_t *out) {
     char *end;
-    const unsigned long val = strtoul(s, &end, 16);
+    const unsigned long v = strtoul(s, &end, 16);
     if (end == s || *end != '\0') return 0;
-    *out = (uint16_t)val;
+    *out = (uint16_t)v;
     return 1;
 }
 
-static int parse_reg(const char *s, uint8_t *reg) {
-    if ((s[0] != 'V' && s[0] != 'v') || s[1] == '\0' || s[2] != '\0')
-        return 0;
-    char c = (char)toupper((unsigned char)s[1]);
-    if (c >= '0' && c <= '9') { *reg = (uint8_t)(c - '0'); return 1; }
-    if (c >= 'A' && c <= 'F') { *reg = (uint8_t)(c - 'A' + 10); return 1; }
-    return 0;
+static void strip_newline(char *s) {
+    size_t n = strlen(s);
+    while (n > 0 && (s[n-1] == '\n' || s[n-1] == '\r')) s[--n] = '\0';
 }
 
-static void write_opcode(FILE *f, const uint16_t opcode) {
-    const uint8_t bytes[2] = { (uint8_t)(opcode >> 8), (uint8_t)(opcode & 0xFF) };
-    fwrite(bytes, 1, 2, f);
+static void strip_comment_and_rtrim(char *s) {
+    char *p = strchr(s, ';');
+    if (p) *p = '\0';
+    size_t n = strlen(s);
+    while (n > 0 && isspace((unsigned char)s[n-1])) s[--n] = '\0';
 }
 
-/*
- * Attempt to parse one line into a Chip-8 opcode.
- *
- * The instructions look like this
- *   CLS, RET,
- *   JP  <addr>
- *   JP  V0, <addr>
- *   CALL <addr>
- *   SE   Vx, <byte>
- *   SNE  Vx, <byte>
- *   SE   Vx, Vy
- *   LD   Vx, <byte>
- *   ADD  Vx, <byte>
- *   LD   Vx, Vy
- *   OR   Vx, Vy
- *   AND  Vx, Vy
- *   XOR  Vx, Vy
- *   ADD  Vx, Vy
- *   SUB  Vx, Vy
- *   SHR  Vx
- *   SUBN Vx, Vy
- *   SHL  Vx
- *   SNE  Vx, Vy
- *   LD   I, <addr>
- *   RND  Vx, <byte>
- *   DRW  Vx, Vy, <nibble>
- *   SKP  Vx
- *   SKNP Vx
- *   LD   Vx, DT
- *   LD   Vx, K
- *   LD   DT, Vx
- *   LD   ST, Vx
- *   ADD  I, Vx
- *   LD   F, Vx
- *   LD   B, Vx
- *   LD   [I], Vx
- *   LD   Vx, [I]
- */
-static int parse_line(const char *line, uint16_t *opcode) {
-    // Tokenise: copy into a mutable buffer and split on spaces/commas. */
-    char buf[64];
-    strncpy(buf, line, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
+static char *ltrim(char *s) {
+    while (*s && isspace((unsigned char)*s)) s++;
+    return s;
+}
 
-    // Replace commas with spaces for uniform splitting. */
-    for (char *p = buf; *p; p++) if (*p == ',') *p = ' ';
-
-    char *tok[8];
-    int n = 0;
-    char *p = strtok(buf, " \t");
-    while (p && n < 8) { tok[n++] = p; p = strtok(nullptr, " \t"); }
-    if (n == 0) return 0; // No tokens in the instruction
-
-    const char *operation = tok[0];
-
-    if (strcmp(operation, "CLS") == 0 && n == 1) {
-        *opcode = 0x00E0; return 1;
+static Header parse_header(const char *line) {
+    if (strcmp(line, "DATA:") == 0) {
+        return DATA;
     }
 
-    if (strcmp(operation, "RET") == 0 && n == 1) {
-        *opcode = 0x00EE; return 1;
+    if (strcmp(line, "CODE:") == 0) {
+        return CODE;
     }
 
-    // JP  <addr> (1nnn)
-    // JP  V0, <addr> (Bnnn)
-    if (strcmp(operation, "JP") == 0) {
-        if (n == 2) {
-            // JP addr */
-            uint16_t addr;
-            if (!parse_hex(tok[1], &addr) || addr > 0xFFF) return 0;
-            *opcode = (uint16_t)(0x1000 | (addr & 0x0FFF)); return 1;
-        }
-        
-        if (n == 3) {
-            // JP V0, addr */
-            uint8_t reg;
-            uint16_t addr;
-            if (!parse_reg(tok[1], &reg) || reg != 0) return 0;
-            if (!parse_hex(tok[2], &addr) || addr > 0xFFF) return 0;
-            *opcode = (uint16_t)(0xB000 | addr & 0x0FFF); return 1;
-        }
-        
-        return 0;
+    return -1;
+}
+
+static bool check_variable_decl(const char *line) {
+    regex_t regex;
+
+    regcomp(&regex, variable_decl_pattern, REG_EXTENDED | REG_NOSUB);
+
+    const int result = regexec(&regex, line, 0, nullptr, 0);
+
+    regfree(&regex);
+    return !result;
+}
+
+static bool check_label_decl(const char *line) {
+    regex_t regex;
+
+    regcomp(&regex, label_decl_pattern, REG_EXTENDED | REG_NOSUB);
+
+    const int result = regexec(&regex, line, 0, nullptr, 0);
+
+    regfree(&regex);
+    return !result;
+}
+
+static bool check_function_decl(const char *line) {
+    regex_t regex;
+
+    regcomp(&regex, function_decl_pattern, REG_EXTENDED | REG_NOSUB);
+
+    const int result = regexec(&regex, line, 0, nullptr, 0);
+
+    regfree(&regex);
+    return !result;
+}
+
+static Operation check_operation(const char *line) {
+    if (strcmp(line, "CLS") == 0) return CLS;
+    if (strcmp(line, "RET") == 0) return RET;
+    if (strncmp(line, "CALL ", 5) == 0) {
+        regex_t regex;
+
+        regcomp(&regex, address_pattern, REG_EXTENDED | REG_NOSUB);
+
+        const int result = regexec(&regex, line + 5, 0, nullptr, 0);
+
+        regfree(&regex);
+        return !result ? CALL : -1;
+    }
+    if (strncmp(line, "JUMP ", 5) == 0) {
+        regex_t regex;
+
+        regcomp(&regex, jump_pattern, REG_EXTENDED | REG_NOSUB);
+
+        const int result = regexec(&regex, line + 5, 0, nullptr, 0);
+
+        regfree(&regex);
+        return !result ? JUMP : -1;
+    }
+    if (strncmp(line, "SE ", 3) == 0) {
+        regex_t regex;
+
+        regcomp(&regex, se_pattern, REG_EXTENDED | REG_NOSUB);
+
+        const int result = regexec(&regex, line + 3, 0, nullptr, 0);
+
+        regfree(&regex);
+        return !result ? SE : -1;
+    }
+    if (strncmp(line, "SNE ", 4) == 0) {
+        regex_t regex;
+
+        // Same argument pattern as SE
+        regcomp(&regex, se_pattern, REG_EXTENDED | REG_NOSUB);
+
+        const int result = regexec(&regex, line + 3, 0, nullptr, 0);
+
+        regfree(&regex);
+        return !result ? SNE : -1;
+    }
+    if (strncmp(line, "SUB ", 4) == 0) {
+        regex_t regex;
+
+        regcomp(&regex, two_register_pattern, REG_EXTENDED | REG_NOSUB);
+
+        const int result = regexec(&regex, line + 4, 0, nullptr, 0);
+
+        regfree(&regex);
+        return !result ? SUB : -1;
+    }
+    if (strncmp(line, "SUBN ", 5) == 0) {
+        regex_t regex;
+
+        regcomp(&regex, two_register_pattern, REG_EXTENDED | REG_NOSUB);
+
+        const int result = regexec(&regex, line + 5, 0, nullptr, 0);
+
+        regfree(&regex);
+        return !result ? SUBN : -1;
+    }
+    if (strncmp(line, "OR ", 3) == 0) {
+        regex_t regex;
+
+        regcomp(&regex, two_register_pattern, REG_EXTENDED | REG_NOSUB);
+
+        const int result = regexec(&regex, line + 3, 0, nullptr, 0);
+
+        regfree(&regex);
+        return !result ? OR : -1;
+    }
+    if (strncmp(line, "AND ", 4) == 0) {
+        regex_t regex;
+
+        regcomp(&regex, two_register_pattern, REG_EXTENDED | REG_NOSUB);
+
+        const int result = regexec(&regex, line + 4, 0, nullptr, 0);
+
+        regfree(&regex);
+        return !result ? AND : -1;
+    }
+    if (strncmp(line, "XOR ", 4) == 0) {
+        regex_t regex;
+
+        regcomp(&regex, two_register_pattern, REG_EXTENDED | REG_NOSUB);
+
+        const int result = regexec(&regex, line + 4, 0, nullptr, 0);
+
+        regfree(&regex);
+        return !result ? XOR : -1;
+    }
+    if (strncmp(line, "SHR ", 4) == 0) {
+        regex_t regex;
+
+        regcomp(&regex, one_register_pattern, REG_EXTENDED | REG_NOSUB);
+
+        const int result = regexec(&regex, line + 4, 0, nullptr, 0);
+
+        regfree(&regex);
+        return !result ? SHR : -1;
+    }
+    if (strncmp(line, "SHL ", 4) == 0) {
+        regex_t regex;
+
+        regcomp(&regex, one_register_pattern, REG_EXTENDED | REG_NOSUB);
+
+        const int result = regexec(&regex, line + 4, 0, nullptr, 0);
+
+        regfree(&regex);
+        return !result ? SHL : -1;
+    }
+    if (strncmp(line, "SKP ", 4) == 0) {
+        regex_t regex;
+
+        regcomp(&regex, one_register_pattern, REG_EXTENDED | REG_NOSUB);
+
+        const int result = regexec(&regex, line + 4, 0, nullptr, 0);
+
+        regfree(&regex);
+        return !result ? SKP : -1;
+    }
+    if (strncmp(line, "SKNP ", 5) == 0) {
+        regex_t regex;
+
+        regcomp(&regex, one_register_pattern, REG_EXTENDED | REG_NOSUB);
+
+        const int result = regexec(&regex, line + 5, 0, nullptr, 0);
+
+        regfree(&regex);
+        return !result ? SKNP : -1;
+    }
+    if (strncmp(line, "DRAW ", 5) == 0) {
+        regex_t regex;
+
+        regcomp(&regex, draw_pattern, REG_EXTENDED | REG_NOSUB);
+
+        const int result = regexec(&regex, line + 5, 0, nullptr, 0);
+
+        regfree(&regex);
+        return !result ? DRAW : -1;
+    }
+    if (strncmp(line, "ADD ", 4) == 0) {
+        regex_t regex;
+
+        regcomp(&regex, add_pattern, REG_EXTENDED | REG_NOSUB);
+
+        const int result = regexec(&regex, line + 4, 0, nullptr, 0);
+
+        regfree(&regex);
+        return !result ? ADD : -1;
+    }
+    if (strncmp(line, "RAND ", 5) == 0) {
+        regex_t regex;
+
+        regcomp(&regex, rand_pattern, REG_EXTENDED | REG_NOSUB);
+
+        const int result = regexec(&regex, line + 5, 0, nullptr, 0);
+
+        regfree(&regex);
+        return !result ? RAND : -1;
+    }
+    if (strncmp(line, "LOAD ", 5) == 0) {
+        regex_t regex;
+
+        regcomp(&regex, load_pattern, REG_EXTENDED | REG_NOSUB);
+
+        const int result = regexec(&regex, line + 5, 0, nullptr, 0);
+
+        regfree(&regex);
+        return !result ? LOAD : -1;
     }
 
-    // CALL <addr> (2nnn)
-    if (strcmp(operation, "CALL") == 0 && n == 2) {
-        uint16_t addr;
-        if (!parse_hex(tok[1], &addr) || addr > 0xFFF) return 0;
-        *opcode = (uint16_t)(0x2000 | addr & 0x0FFF); return 1;
+    return -1;
+}
+
+// Add the symbol unless there are too many or if there is a duplicate symbol
+static void add_symbol(SymbolTable *table, const Symbol *symbol) {
+    if (table->count == MAX_SYMBOLS - 1) {
+        fprintf(stderr, "Too many symbols");
+        exit(1);
     }
 
-    // SKP  Vx (Ex9E)
-    // SKNP Vx (ExA1)
-    if (strcmp(operation, "SKP") == 0 && n == 2) {
-        uint8_t x;
-        if (!parse_reg(tok[1], &x)) return 0;
-        *opcode = (uint16_t)(0xE09E | (uint16_t)x << 8); return 1;
-    }
-    
-    if (strcmp(operation, "SKNP") == 0 && n == 2) {
-        uint8_t x;
-        if (!parse_reg(tok[1], &x)) return 0;
-        *opcode = (uint16_t)(0xE0A1 | (uint16_t)x << 8); return 1;
-    }
-
-    // SHR  Vx (8xy6)
-    // SHL  Vx (8xyE)
-    if (strcmp(operation, "SHR") == 0 && n == 2) {
-        uint8_t x;
-        
-        if (!parse_reg(tok[1], &x)) return 0;
-        
-        *opcode = (uint16_t)(0x8006 | (uint16_t)x << 8); return 1;
-    }
-    
-    if (strcmp(operation, "SHL") == 0 && n == 2) {
-        uint8_t x;
-        
-        if (!parse_reg(tok[1], &x)) return 0;
-        
-        *opcode = (uint16_t)(0x800E | (uint16_t)x << 8); return 1;
-    }
-
-    // RND  Vx, byte (Cxkk)
-    if (strcmp(operation, "RND") == 0 && n == 3) {
-        uint8_t x;
-        uint16_t kk;
-        
-        if (!parse_reg(tok[1], &x)) return 0;
-        if (!parse_hex(tok[2], &kk) || kk > 0xFF) return 0;
-        
-        *opcode = (uint16_t)(0xC000 | (uint16_t)x << 8 | kk & 0xFF); return 1;
-    }
-
-    // DRW  Vx, Vy, nibble (Dxyn)
-    if (strcmp(operation, "DRW") == 0 && n == 4) {
-        uint8_t x, y;
-        uint16_t nibble;
-        
-        if (!parse_reg(tok[1], &x)) return 0;
-        if (!parse_reg(tok[2], &y)) return 0;
-        if (!parse_hex(tok[3], &nibble) || nibble > 0xF) return 0;
-        
-        *opcode = (uint16_t)(0xD000 | (uint16_t)x << 8 | (uint16_t)y << 4 | nibble & 0xF);
-        return 1;
-    }
-
-    // SE  Vx, byte  (3xkk)  or  SE  Vx, Vy (5xy0)
-    // SNE Vx, byte  (4xkk)  or  SNE Vx, Vy (9xy0)
-    if (strcmp(operation, "SE") == 0 && n == 3) {
-        uint8_t x, y;
-        uint16_t kk;
-        
-        if (!parse_reg(tok[1], &x)) return 0;
-        
-        if (parse_reg(tok[2], &y)) {
-            // SE Vx, Vy
-            *opcode = (uint16_t)(0x5000 | ((uint16_t)x << 8) | ((uint16_t)y << 4)); return 1;
-        }
-        
-        if (parse_hex(tok[2], &kk) && kk <= 0xFF) {
-            // SE Vx, byte
-            *opcode = (uint16_t)(0x3000 | ((uint16_t)x << 8) | (kk & 0xFF)); return 1;
-        }
-        
-        return 0;
-    }
-    
-    if (strcmp(operation, "SNE") == 0 && n == 3) {
-        uint8_t x, y;
-        uint16_t kk;
-        
-        if (!parse_reg(tok[1], &x)) return 0;
-        
-        if (parse_reg(tok[2], &y)) {
-            // SNE Vx, Vy
-            *opcode = (uint16_t)(0x9000 | ((uint16_t)x << 8) | ((uint16_t)y << 4)); return 1;
-        }
-        
-        if (parse_hex(tok[2], &kk) && kk <= 0xFF) {
-            // SNE Vx, byte
-            *opcode = (uint16_t)(0x4000 | ((uint16_t)x << 8) | (kk & 0xFF)); return 1;
-        }
-        
-        return 0;
-    }
-
-    // ADD Vx, byte (7xkk)
-    // ADD Vx, Vy (8xy4)
-    // ADD I,  Vx (Fx1E)
-    if (strcmp(operation, "ADD") == 0 && n == 3) {
-        uint8_t x, y;
-        uint16_t kk;
-        
-        if (strcmp(tok[1], "I") == 0) {
-            // ADD I, Vx */
-            if (!parse_reg(tok[2], &y)) return 0;
-            *opcode = (uint16_t)(0xF01E | (uint16_t)y << 8); return 1;
-        }
-        
-        if (!parse_reg(tok[1], &x)) return 0;
-        
-        if (parse_reg(tok[2], &y)) {
-            // ADD Vx, Vy */
-            *opcode = (uint16_t)(0x8004 | (uint16_t)x << 8 | (uint16_t)y << 4); return 1;
-        }
-        
-        if (parse_hex(tok[2], &kk) && kk <= 0xFF) {
-            // ADD Vx, byte */
-            *opcode = (uint16_t)(0x7000 | (uint16_t)x << 8 | kk & 0xFF); return 1;
-        }
-        
-        return 0;
-    }
-
-    // OR   Vx, Vy  (8xy1)
-    // AND  Vx, Vy  (8xy2)
-    // XOR  Vx, Vy  (8xy3)
-    // SUB  Vx, Vy  (8xy5)
-    // SUBN Vx, Vy  (8xy7)
-
-    // ReSharper disable once CppTooWideScope
-    const struct { const char *name; uint8_t lo; } alu_ops[] = {
-        { "OR",   0x1 }, { "AND",  0x2 }, { "XOR",  0x3 },
-        { "SUB",  0x5 }, { "SUBN", 0x7 },
-    };
-    
-    for (int i = 0; i < 5; i++) {
-        if (strcmp(operation, alu_ops[i].name) == 0 && n == 3) {
-            uint8_t x, y;
-            if (!parse_reg(tok[1], &x)) return 0;
-            if (!parse_reg(tok[2], &y)) return 0;
-            *opcode = (uint16_t)(0x8000 | ((uint16_t)x << 8) | ((uint16_t)y << 4) | alu_ops[i].lo);
-            return 1;
+    for (int i = 0; i < table->count; i++) {
+        if (strcmp(table->symbols[i].name, symbol->name) == 0) {
+            fprintf(stderr, "Duplicate symbol: %s", symbol->name);
+            printf("\nOriginally, %s is held by the %d kind symbol at address %lu", symbol->name, table->symbols[i].kind, table->symbols[i].address);
+            exit(1);
         }
     }
 
-    // LD  Vx, byte  (6xkk)
-    // LD  Vx, Vy   (8xy0)
-    // LD  I, addr  (Annn)
-    // LD  Vx, DT   (Fx07)
-    // LD  Vx, K    (Fx0A)
-    // LD  DT, Vx   (Fx15)
-    // LD  ST, Vx   (Fx18)
-    // LD  F,  Vx   (Fx29)
-    // LD  B,  Vx   (Fx33)
-    // LD  [I], Vx  (Fx55)
-    // LD  Vx, [I]  (Fx65)
-    if (strcmp(operation, "LD") == 0 && n == 3) {
-        uint8_t x, y;
-        uint16_t addr, kk;
+    table->symbols[table->count++] = *symbol;
+}
 
-        // LD I, addr
-        if (strcmp(tok[1], "I") == 0) {
-            if (!parse_hex(tok[2], &addr) || addr > 0xFFF) return 0;
-            *opcode = (uint16_t)(0xA000 | addr & 0x0FFF); return 1;
-        }
-        
-        // LD DT, Vx */
-        if (strcmp(tok[1], "DT") == 0) {
-            if (!parse_reg(tok[2], &y)) return 0;
-            *opcode = (uint16_t)(0xF015 | (uint16_t)y << 8); return 1;
-        }
-        
-        // LD ST, Vx */
-        if (strcmp(tok[1], "ST") == 0) {
-            if (!parse_reg(tok[2], &y)) return 0;
-            *opcode = (uint16_t)(0xF018 | (uint16_t)y << 8); return 1;
-        }
-        
-        // LD F, Vx */
-        if (strcmp(tok[1], "F") == 0) {
-            if (!parse_reg(tok[2], &y)) return 0;
-            *opcode = (uint16_t)(0xF029 | (uint16_t)y << 8); return 1;
-        }
-        
-        // LD B, Vx */
-        if (strcmp(tok[1], "B") == 0) {
-            if (!parse_reg(tok[2], &y)) return 0;
-            *opcode = (uint16_t)(0xF033 | (uint16_t)y << 8); return 1;
-        }
-        
-        // LD [I], Vx */
-        if (strcmp(tok[1], "[I]") == 0) {
-            if (!parse_reg(tok[2], &y)) return 0;
-            *opcode = (uint16_t)(0xF055 | (uint16_t)y << 8); return 1;
+static void construct_table(FILE *input, SymbolTable *table) {
+    char line[MAX_LINE_SIZE];
+    uint64_t line_number = 0;
+    Header header = -1;
+    size_t address = ROM_START + 2;
+
+    // For simplicity do not want many CODE, DATA, CODE, DATA CODE etc. sequences of headers
+    bool can_change_header = true;
+
+    while (fgets(line, MAX_LINE_SIZE, input)) {
+        line_number++;
+
+        strip_comment_and_rtrim(line);
+        strip_newline(line);
+        char *line_start = ltrim(line);
+        if (*line_start == '\0') continue;  // Empty line
+
+        if (parse_header(line_start) == DATA) {
+            if (!can_change_header) {
+                fprintf(stderr, "Changed headers too many times at line %lu - %s", line_number, line_start);
+                exit(1);
+            }
+
+            if (header == CODE) {
+                can_change_header = false;
+            }
+
+            header = DATA;
+
+            continue;
         }
 
-        // Destination must be a register from here on */
-        if (!parse_reg(tok[1], &x)) return 0;
+        if (parse_header(line_start) == CODE) {
+            if (!can_change_header) {
+                fprintf(stderr, "Changed headers too many times at line %lu - %s", line_number, line_start);
+                exit(1);
+            }
 
-        // LD Vx, DT */
-        if (strcmp(tok[2], "DT") == 0) {
-            *opcode = (uint16_t)(0xF007 | (uint16_t)x << 8); return 1;
+            if (header == DATA) {
+                can_change_header = false;
+            }
+
+            header = CODE;
+            continue;
         }
-        
-        // LD Vx, K */
-        if (strcmp(tok[2], "K") == 0) {
-            *opcode = (uint16_t)(0xF00A | (uint16_t)x << 8); return 1;
+
+        if (header == DATA) {
+            // Expect variables here
+            if (!check_variable_decl(line_start)) {
+                fprintf(stderr, "Invalid variable declaration at line %lu - %s", line_number, line_start);
+                exit(1);
+            }
+
+            size_t length = 0;
+
+            for (int i = 0; i < strlen(line_start); i++) {
+                if (line_start[i] == ':') {
+                    length = i;
+                }
+            }
+
+            line_start[length] = '\0';
+
+            if (length >= MAX_NAME_SIZE) {
+                fprintf(stderr, "Too long variable name at line %lu - %s", line_number, line_start);
+            }
+
+            Symbol var;
+            var.address = address;
+            var.kind = VARIABLE;
+            strncpy(var.name, line_start, MAX_NAME_SIZE - 1);
+
+            add_symbol(table, &var);
+
+            // Find out how many bytes are specified
+            const char *byte_ptr = strtok(line_start + length + 2, " ");
+            size_t bytes = 0;
+
+            while (byte_ptr != nullptr) {
+                bytes++;
+                byte_ptr = strtok(nullptr, " ");
+            }
+
+            if (bytes > MAX_VAR_SIZE) {
+                fprintf(stderr, "Too many bytes specified at line %lu - %s", line_number, line_start);
+                exit(1);
+            }
+
+            address += bytes;
+
+            if (address >= MEMORY_SIZE) {
+                fprintf(stderr, "Ran out of ROM space for line %lu - %s", line_number, line_start);
+                exit(1);
+            }
+
+            continue;
         }
-        
-        // LD Vx, [I] */
-        if (strcmp(tok[2], "[I]") == 0) {
-            *opcode = (uint16_t)(0xF065 | (uint16_t)x << 8); return 1;
+
+        if (header == CODE) {
+            if (check_label_decl(line_start)) {
+                // Add this label to our symbol table
+                Symbol label;
+                label.address = address;
+                label.kind = LABEL;
+                strncpy(label.name, line_start + 6, MAX_NAME_SIZE - 1);
+
+                add_symbol(table, &label);
+
+                continue;
+            }
+
+            if (check_function_decl(line_start)) {
+                // Add this function to our symbol table
+                Symbol func;
+                func.address = address;
+                func.kind = FUNCTION;
+                strncpy(func.name, line_start + 9, MAX_NAME_SIZE - 1);
+
+                add_symbol(table, &func);
+
+                continue;
+            }
+
+            if (check_operation(line_start) == -1) {
+                fprintf(stderr, "Invalid operation at line %lu - %s", line_number, line_start);
+                exit(1);
+            }
+
+            // We have a valid operation which takes up 2 bytes
+            address += 2;
+
+            if (address >= MEMORY_SIZE) {
+                fprintf(stderr, "Ran out of ROM space for line %lu - %s", line_number, line_start);
+                exit(1);
+            }
+
+            continue;
         }
-        
-        // LD Vx, Vy */
-        if (parse_reg(tok[2], &y)) {
-            *opcode = (uint16_t)(0x8000 | (uint16_t)x << 8 | (uint16_t)y << 4); return 1;
+
+        fprintf(stderr, "Code not under a header at line %lu - %s", line_number, line_start);
+        exit(1);
+    }
+}
+
+static void emit_bytes(FILE *input, FILE *output, const SymbolTable *table) {
+    // We have a syntactically valid input file since otherwise construct_table would have failed
+    char line[MAX_LINE_SIZE];
+    Header header = -1;
+
+    int main_index = -1;
+    for (int i = 0; i < table->count; i++) {
+        if (strcmp(table->symbols[i].name, "main") == 0) {
+            main_index = i;
+            break;
         }
-        
-        // LD Vx, byte */
-        if (parse_hex(tok[2], &kk) && kk <= 0xFF) {
-            *opcode = (uint16_t)(0x6000 | (uint16_t)x << 8 | kk & 0xFF); return 1;
-        }
-        
-        return 0;
     }
 
-    return 0; // Unrecognised instruction
+    if (main_index == -1) {
+        fprintf(stderr, "No main function found");
+        exit(1);
+    }
+
+    // Emit instruction to jump to main
+    uint16_t jump_to_main_opcode = 0x1000;
+    jump_to_main_opcode |= table->symbols[main_index].address;
+
+    const uint8_t top = jump_to_main_opcode >> 8;
+    const uint8_t bottom = jump_to_main_opcode & 0xFF;
+
+    fwrite(&top, 1, 1, output);
+    fwrite(&bottom, 1, 1, output);
+
+    size_t line_number = 0;
+
+    while (fgets(line, MAX_LINE_SIZE, input)) {
+        line_number++;
+        strip_comment_and_rtrim(line);
+        strip_newline(line);
+        char *line_start = ltrim(line);
+        if (*line_start == '\0') continue; // Empty line
+
+        if (parse_header(line_start) == DATA) {
+            header = DATA;
+            continue;
+        }
+
+        if (parse_header(line_start) == CODE) {
+            header = CODE;
+            continue;
+        }
+
+        if (header == DATA) {
+            // Emit bytes for variable
+            size_t colon_position = 0;
+
+            for (int i = 0; i < strlen(line_start); i++) {
+                if (line_start[i] == ':') {
+                    colon_position = i;
+                }
+            }
+
+            const char *byte_ptr = strtok(line_start + colon_position + 2, " ");
+
+            while (byte_ptr != nullptr) {
+                uint16_t parsed_byte = 0;
+                parse_hex(byte_ptr, &parsed_byte);
+                uint8_t byte = (uint8_t) parsed_byte & 0xFF;
+                fwrite(&byte, 1, 1, output);
+                byte_ptr = strtok(nullptr, " ");
+            }
+        }
+
+        if (header == CODE) {
+            const Operation operation = check_operation(line_start);
+            uint16_t opcode = 0;
+
+            switch (operation) {
+                case CLS: {
+                    opcode = 0x00E0;
+                    break;
+                }
+                case RET: {
+                    opcode = 0x00EE;
+                    break;
+                }
+                case JUMP: {
+                    if (line_start[5] == '<') {
+                        // Address of a label
+                        int i = 1;
+
+                        while (true) {
+                            if (line_start[5 + i] == '>') {
+                                line_start[5 + i] = '\0';
+                                break;
+                            }
+
+                            i++;
+                        }
+
+                        const char *name = line_start + 6;
+
+                        uint16_t address = 0;
+
+                        for (int j = 0; j < table->count; j++) {
+                            if (strcmp(name, table->symbols[j].name) == 0) {
+                                if (table->symbols[j].kind != LABEL) {
+                                    fprintf(stderr, "Jump to symbol that is not a label at line %lu - %s", line_number, line_start);
+                                    exit(1);
+                                }
+
+                                address = table->symbols[j].address;
+                                break;
+                            }
+                        }
+
+                        if (address == 0) {
+                            fprintf(stderr, "Unknown label at line %lu - %s", line_number, line_start);
+                            exit(1);
+                        }
+
+                        opcode = 0x1000;
+                        opcode |= address;
+                    } else {
+                        // Hardcoded address
+                        uint16_t address = 0;
+                        parse_hex(line_start + 5, &address);
+
+                        opcode = 0x1000;
+                        opcode |= address;
+                    }
+
+                    break;
+                }
+                case CALL: {
+                    if (line_start[5] == '<') {
+                        // Address of a label
+                        int i = 1;
+
+                        while (true) {
+                            if (line_start[5 + i] == '>') {
+                                line_start[5 + i] = '\0';
+                                break;
+                            }
+
+                            i++;
+                        }
+
+                        const char *name = line_start + 6;
+
+                        uint16_t address = 0;
+
+                        for (int j = 0; j < table->count; j++) {
+                            if (strcmp(name, table->symbols[j].name) == 0) {
+                                if (table->symbols[j].kind != FUNCTION) {
+                                    fprintf(stderr, "Jump to symbol that is not a label at line %lu - %s", line_number, line_start);
+                                    exit(1);
+                                }
+
+                                address = table->symbols[j].address;
+                                break;
+                            }
+                        }
+
+                        if (address == 0) {
+                            fprintf(stderr, "Unknown label at line %lu - %s", line_number, line_start);
+                            exit(1);
+                        }
+
+                        opcode = 0x2000;
+                        opcode |= address;
+                    } else {
+                        // Hardcoded address
+                        uint16_t address = 0;
+                        parse_hex(line_start + 5, &address);
+
+                        opcode = 0x2000;
+                        opcode |= address;
+                    }
+
+                    break;
+                }
+                case SE: {
+                    const char x = line_start[4];
+
+                    if ('0' <= x && x <= '9') {
+                        opcode = (x - '0') << 8;
+                    } else {
+                        opcode = (x - 'A' + 10) << 8;
+                    }
+
+                    switch (line_start[6]) {
+                        case 'V': {
+                            const char y = line_start[7];
+
+                            if ('0' <= y && y <= '9') {
+                                opcode |= 0x5000 | (y - '0') << 4;
+                            } else {
+                                opcode |= 0x5000 | (y - 'A' + 10) << 4;
+                            }
+
+                            break;
+                        }
+                        default: {
+                            uint16_t byte = 0;
+                            parse_hex(line_start + 6, &byte);
+
+                            opcode |= 0x3000 | byte;
+
+                            break;
+                        }
+                    }
+
+                    break;
+                }
+                case SNE: {
+                    const char x = line_start[5];
+
+                    if ('0' <= x && x <= '9') {
+                        opcode = (x - '0') << 8;
+                    } else {
+                        opcode = (x - 'A' + 10) << 8;
+                    }
+
+                    switch (line_start[7]) {
+                        case 'V': {
+                            const char y = line_start[8];
+
+                            if ('0' <= y && y <= '9') {
+                                opcode |= 0x9000 | (y - '0') << 4;
+                            } else {
+                                opcode |= 0x9000 | (y - 'A' + 10) << 4;
+                            }
+
+                            break;
+                        }
+                        default: {
+                            uint16_t byte = 0;
+                            parse_hex(line_start + 7, &byte);
+
+                            opcode |= 0x4000 | byte;
+
+                            break;
+                        }
+                    }
+
+                    break;
+                }
+                case LOAD: {
+                    // We know there are exactly two arguments
+                    char * tokens[2];
+
+                    tokens[0] = strtok(line_start + 5, " ");
+                    tokens[1] = strtok(nullptr, " ");
+
+                    if (*tokens[0] == 'F') {
+                        uint16_t reg;
+                        parse_hex(tokens[1] + 1, &reg);
+                        opcode = 0xF029 | reg << 8;
+                        break;
+                    }
+
+                    if (*tokens[0] == 'B') {
+                        uint16_t reg;
+                        parse_hex(tokens[1] + 1, &reg);
+                        opcode = 0xF033 | reg << 8;
+                        break;
+                    }
+
+                    if (*tokens[0] == 'I') {
+                        if (*tokens[1] == '<') {
+                            // Address of a label
+                            int i = 1;
+
+                            while (true) {
+                                if (tokens[1][i] == '>') {
+                                    tokens[1][i] = '\0';
+                                    break;
+                                }
+
+                                i++;
+                            }
+
+                            const char *name = tokens[1] + 1;
+
+                            uint16_t address = 0;
+
+                            for (int j = 0; j < table->count; j++) {
+                                if (strcmp(name, table->symbols[j].name) == 0) {
+                                    address = table->symbols[j].address;
+                                    break;
+                                }
+                            }
+
+                            if (address == 0) {
+                                fprintf(stderr, "Unknown symbol at line %lu - %s", line_number, line_start);
+                                exit(1);
+                            }
+
+                            opcode = 0xA000;
+                            opcode |= address;
+                        } else {
+                            // Hardcoded address
+                            uint16_t address = 0;
+                            parse_hex(tokens[1], &address);
+
+                            opcode = 0xA000;
+                            opcode |= address;
+                        }
+
+                        break;
+                    }
+
+                    if (strncmp(tokens[0], "[I]", 3) == 0) {
+                        uint16_t reg;
+                        parse_hex(tokens[1] + 1, &reg);
+                        opcode = 0xF055 | reg << 8;
+
+                        break;
+                    }
+
+                    if (strncmp(tokens[0], "DT", 2) == 0) {
+                        uint16_t reg;
+                        parse_hex(tokens[1] + 1, &reg);
+                        opcode = 0xF015 | reg << 8;
+
+                        break;
+                    }
+
+                    if (strncmp(tokens[0], "ST", 2) == 0) {
+                        uint16_t reg;
+                        parse_hex(tokens[1] + 1, &reg);
+                        opcode = 0xF018 | reg << 8;
+
+                        break;
+                    }
+
+                    if (*tokens[1] == 'K') {
+                        tokens[0][2] = '\0';
+                        uint16_t nibble;
+                        parse_hex(tokens[0] + 1, &nibble);
+                        opcode = 0xF00A | nibble << 8;
+
+                        break;
+                    }
+
+                    // From here on in we know that the first argument is a register
+                    tokens[0][2] = '\0';
+                    uint16_t reg_x;
+                    parse_hex(tokens[0] + 1, &reg_x);
+
+                    if (strncmp(tokens[1], "DT", 2) == 0) {
+                        opcode = 0xF015 | reg_x << 8;
+
+                        break;
+                    }
+
+                    if (strncmp(tokens[1], "[I]", 3) == 0) {
+                        opcode = 0xF065 | reg_x << 8;
+
+                        break;
+                    }
+
+                    if (*tokens[1] == 'V') {
+                        uint16_t reg_y;
+                        parse_hex(tokens[1] + 1, &reg_y);
+                        opcode = 0x8000 | reg_x << 8 | reg_y << 4;
+
+                        break;
+                    }
+
+                    uint16_t byte;
+                    parse_hex(tokens[1], &byte);
+                    opcode = 0x6000 | reg_x << 8 | byte;
+
+                    break;
+                }
+                case ADD: {
+                    if (line_start[4] == 'I') {
+                        uint16_t reg;
+                        parse_hex(line_start + 7, &reg);
+                        opcode = 0xF01E | reg << 8;
+                    }
+
+                    // Otherwise the first argument is a register
+                    uint16_t reg_x;
+                    line_start[6] = '\0';
+                    parse_hex(line_start + 5, &reg_x);
+
+                    if (line_start[7] == 'V') {
+                        uint16_t reg_y;
+                        parse_hex(line_start + 8, &reg_y);
+                        opcode = 0x8004 | reg_x << 8 | reg_y << 4;
+                    }
+
+                    uint16_t byte;
+                    parse_hex(line_start + 7, &byte);
+                    opcode = 0x7000 | reg_x << 8 | byte;
+
+                    break;
+                }
+                case OR: {
+                    uint16_t reg_x, reg_y;
+                    line_start[5] = '\0';
+                    parse_hex(line_start + 4, &reg_x);
+                    parse_hex(line_start + 7, &reg_y);
+
+                    opcode = 0x8001 | reg_x << 8 | reg_y << 4;
+
+                    break;
+                }
+                case AND: {
+                    uint16_t reg_x, reg_y;
+                    line_start[6] = '\0';
+                    parse_hex(line_start + 5, &reg_x);
+                    parse_hex(line_start + 8, &reg_y);
+
+                    opcode = 0x8002 | reg_x << 8 | reg_y << 4;
+
+                    break;
+                }
+                case XOR: {
+                    uint16_t reg_x, reg_y;
+                    line_start[6] = '\0';
+                    parse_hex(line_start + 5, &reg_x);
+                    parse_hex(line_start + 8, &reg_y);
+
+                    opcode = 0x8003 | reg_x << 8 | reg_y << 4;
+
+                    break;
+                }
+                case SUB: {
+                    uint16_t reg_x, reg_y;
+                    line_start[6] = '\0';
+                    parse_hex(line_start + 5, &reg_x);
+                    parse_hex(line_start + 8, &reg_y);
+
+                    opcode = 0x8005 | reg_x << 8 | reg_y << 4;
+
+                    break;
+                }
+                case SUBN: {
+                    uint16_t reg_x, reg_y;
+                    line_start[7] = '\0';
+                    parse_hex(line_start + 6, &reg_x);
+                    parse_hex(line_start + 9, &reg_y);
+
+                    opcode = 0x8007 | reg_x << 8 | reg_y << 4;
+
+                    break;
+                }
+                case SHR: {
+                    uint16_t reg;
+                    parse_hex(line_start + 5, &reg);
+
+                    opcode = 0x8006 | reg << 8;
+
+                    break;
+                }
+                case SHL: {
+                    uint16_t reg;
+                    parse_hex(line_start + 5, &reg);
+
+                    opcode = 0x800E | reg << 8;
+
+                    break;
+                }
+                case RAND: {
+                    line_start[7] = '\0';
+
+                    uint16_t reg;
+                    parse_hex(line_start + 6, &reg);
+                    uint16_t byte;
+                    parse_hex(line_start + 8, &byte);
+
+                    opcode = 0xC000 | reg << 8 | byte;
+
+                    break;
+                }
+                case DRAW: {
+                    line_start[7] = '\0';
+                    line_start[10] = '\0';
+
+                    uint16_t reg_x, reg_y, h;
+                    parse_hex(line_start + 6, &reg_x);
+                    parse_hex(line_start + 9, &reg_y);
+                    parse_hex(line_start + 11, &h);
+
+                    opcode = 0xD000 | reg_x << 8 | reg_y << 4 | h;
+
+                    break;
+                }
+                case SKP: {
+                    uint16_t reg;
+                    parse_hex(line_start + 5, &reg);
+
+                    opcode = 0xE09E | reg << 8;
+
+                    break;
+                }
+                case SKNP: {
+                    uint16_t reg;
+                    parse_hex(line_start + 5, &reg);
+
+                    opcode = 0xE0A1 | reg << 8;
+
+                    break;
+                }
+                // This line was a symbol declaration
+                default: continue;
+            }
+
+            const uint8_t opcode_top = opcode >> 8;
+            const uint8_t opcode_bottom = opcode & 0xFF;
+
+            fwrite(&opcode_top, 1, 1, output);
+            fwrite(&opcode_bottom, 1, 1, output);
+        }
+    }
 }
 
 void assemble(const char *input_file_name, const char *output_file_name) {
-    const size_t in_len  = strlen(input_file_name);
-    const size_t out_len = strlen(output_file_name);
+    char input_file_path[32 + strlen(input_file_name)];
+    char output_file_path[32 + strlen(output_file_name)];
 
-    char input_path[16 + in_len];
-    char output_path[16 + out_len];
+    snprintf(input_file_path, 32 + strlen(input_file_name), "chip8-source/%s.c8c", input_file_name);
+    snprintf(output_file_path, 32 + strlen(output_file_name), "assembled/%s.ch8", output_file_name);
 
-    snprintf(input_path,  15 + in_len  + 1, "chip8-source/%s", input_file_name);
-    snprintf(output_path, 15 + out_len + 1, "assembled/%s",    output_file_name);
-
-    struct stat st = {0};
-    if (stat("assembled", &st) == -1) {
-        mkdir("assembled", 0700);
-    }
-
-    FILE *input  = fopen(input_path,  "r");
-    FILE *output = fopen(output_path, "wb");
+    FILE *input = fopen(input_file_path, "r");
+    FILE *output = fopen(output_file_path, "wb");
 
     if (!input) {
-        fprintf(stderr, "Could not open chip8 source file from path %s\n", input_path);
+        fprintf(stderr, "Could not open input file %s", input_file_path);
         exit(1);
     }
+
     if (!output) {
-        fprintf(stderr, "Could not create chip8 binary file at path %s\n", output_path);
-        fclose(input);
+        fprintf(stderr, "Could not open output file %s", output_file_path);
         exit(1);
     }
 
-    char line[64];
-    int line_num = 0;
+    SymbolTable *table = malloc(sizeof(SymbolTable));
 
-    while (fgets(line, sizeof(line), input)) {
-        line_num++;
-        strip_newline(line);
-
-        // Skip blank lines and comments (lines starting with ';'). */
-        if (line[0] == '\0' || line[0] == ';') continue;
-
-        uint16_t opcode;
-        if (!parse_line(line, &opcode)) {
-            fprintf(stderr, "Line %d: erroneous instruction: %s\n", line_num, line);
-            fclose(input); fclose(output);
-            exit(1);
-        }
-
-        write_opcode(output, opcode);
+    if (table == nullptr) {
+        fprintf(stderr, "Could not allocate memory for symbol table");
+        exit(1);
     }
 
-    fclose(input);
-    fclose(output);
+    construct_table(input, table);
+
+    rewind(input);
+
+    emit_bytes(input, output, table);
+
+    free(table);
+
+    const int result1 = fclose(input);
+    const int result2 = fclose(output);
+
+    if (result1 != 0) {
+        fprintf(stderr, "Could not close file %s", input_file_path);
+        exit(1);
+    }
+
+    if (result2 != 0) {
+        fprintf(stderr, "Could not close file %s", output_file_path);
+        exit(1);
+    }
 }
